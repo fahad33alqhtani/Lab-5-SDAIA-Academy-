@@ -45,15 +45,44 @@ Image ships as a non-root `appuser`, healthcheck on `/v1/ready`,
 
 ## Day 3 — Lab 5 (CI/CD pipeline)
 
-_Fill in as you complete each step — reference numbers from the course:_
+### Gate commands, measured locally (what each CI job actually runs)
+
+| Metric | Value |
+|---|---|
+| `ruff check src tests` | 0.9 s cold / 0.1 s warm |
+| `lint-imports` (architecture contract) | 0.3 s — Contracts: 1 kept, 0 broken |
+| `mypy src/fraud_service --strict` | Success: no issues in 15 source files |
+| `pytest -m "not slow" --cov-fail-under=80` | 52 passed in 2.5 s, branch coverage 98.66% |
+| `pytest -m behavioural --no-cov` | 3 passed in 6.1 s (real model artefact) |
+
+### GitHub Actions run (fill in from the Actions UI after the first push)
 
 | Metric | Value |
 |---|---|
 | lint job duration | |
 | test job duration | |
-| image-smoke — cold run | ~5 min 40 s (reference) |
-| image-smoke — warm run (GHA cache) | ~1 min 02 s (reference) |
+| image-smoke — cold run | _(course reference: ~5 min 40 s)_ |
+| image-smoke — warm run (GHA cache) | _(course reference: ~1 min 02 s)_ |
+| publish job duration | |
 | bad-pr blocked by branch protection? | yes / no |
+
+### bad-pr — both gates proven red before the fix
+
+| Check | Result on `bad-pr` |
+|---|---|
+| `ruff check` | passes — style linting does not catch either bug, which is the point |
+| `lint-imports` | **BROKEN** — `fraud_service.domain.policies -> fraud_service.api.schemas (l.6)` |
+| `pytest -m "not slow"` | **1 failed**, 51 passed — `test_decision_bands[0.85-block]`: `assert 'review' == 'block'` |
+| after the proper fix (import removed, `>=` restored) | all four gates green again, no test weakened |
+
+**Note on the test job.** The lab guide prints the behavioural step as
+`pytest -m "behavioural and not slow"`. In this repository
+`tests/behavioural/` sets `pytestmark = [behavioural, slow]`, so that selector
+collects **zero** tests and pytest exits with code 5 — a red job that ran no
+tests at all. The step therefore runs `pytest -m behavioural --no-cov`:
+`--no-cov` because `fail_under = 80` in `pyproject.toml` is global, and a
+behavioural-only run reports ~65% coverage, failing a gate that the fast-suite
+step already enforces on the full suite.
 
 ## Day 3 — Lab 6 (Config, Secrets & Logs)
 
