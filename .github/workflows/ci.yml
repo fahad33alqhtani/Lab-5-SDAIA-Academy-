@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  pull_request:                    # gates every PR
+  push:
+    branches: [main]               # main also builds + publishes
+  workflow_dispatch:               # manual demo / hotfix runs
+
+permissions:
+  contents: read                   # least privilege default
+
+concurrency:
+  group: ci-${{ github.ref }}      # cancel superseded runs
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:                            # cheapest gate first
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: pip install -e ".[dev,api]" mypy import-linter
+      - name: Ruff (style + import layer rules)
+        run: ruff check src tests
+      - name: Import-linter (architecture contract)
+        run: lint-imports
+      - name: Mypy (type-check the seams)
+        run: mypy src/fraud_service --strict
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: pip install -e ".[dev,api]"
+      - name: Fast suite — the per-commit gate
+        run: pytest -m "not slow" --cov-fail-under=80
+      # The guide prints `-m "behavioural and not slow"`, but in THIS repo
+      # tests/behavioural sets `pytestmark = [behavioural, slow]`, so that
+      # selector collects 0 tests and pytest exits 5 (red job, no tests run).
+      # `--no-cov` because pyproject's fail_under=80 is global: a
+      # behavioural-only run reports ~65% and would fail the coverage gate
+      # that the fast step above already enforces on the full fast suite.
+      - name: Behavioural gate — real model artefact
+        run: pytest -m behavioural --no-cov -q
+      - name: Upload coverage (evidence, even on fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage
+
+  image-smoke:                     # build once, prove the artefact
+    runs-on: ubuntu-latest
+    needs: [lint, test]            # gated by the cheap checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build with GHA layer cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true               # load locally so we can smoke it
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the container
+        run: |
+          docker run -d --name svc -p 8000:8000 \
+            ${{ env.IMAGE }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8000/v1/ready && break || sleep 2
+          done
+          curl -fsS localhost:8000/v1/predict \
+               -H "content-type: application/json" \
+               -d @payloads/sample.json \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); \
+                          assert 0<=b['fraud_probability']<=1; \
+                          assert b['model_version']; print('smoke OK')"
+          docker logs svc --tail 5
+
+  publish:                         # delivery: only on main, never PRs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [image-smoke]
+    permissions:
+      contents: read
+      packages: write              # scoped token for GHCR push, no PAT
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (SHA + channel tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
